@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+contract UtilityTwin_FHE is SepoliaConfig {
+    struct EncryptedUtility {
+        uint256 utilityId;
+        address owner;
+        euint32 encryptedDepth;
+        euint32 encryptedPressure;
+        euint32 encryptedDiameter;
+        euint32 encryptedMaterialCode;
+        euint32 encryptedXCoord;
+        euint32 encryptedYCoord;
+        uint256 timestamp;
+    }
+
+    struct SimulationResult {
+        string safetyAssessment;
+        string maintenanceRecommendation;
+        string conflictWarning;
+        bool isRevealed;
+    }
+
+    uint256 public utilityCount;
+    mapping(uint256 => EncryptedUtility) public encryptedUtilities;
+    mapping(uint256 => SimulationResult) public simulationResults;
+    mapping(uint256 => uint256) private requestToUtilityId;
+
+    event UtilityAdded(uint256 indexed utilityId, address indexed owner);
+    event SimulationRequested(uint256 indexed utilityId);
+    event SimulationCompleted(uint256 indexed utilityId);
+
+    modifier onlyOwner(uint256 utilityId) {
+        require(msg.sender == encryptedUtilities[utilityId].owner, "Not owner");
+        _;
+    }
+
+    function addEncryptedUtility(
+        euint32 depth,
+        euint32 pressure,
+        euint32 diameter,
+        euint32 materialCode,
+        euint32 xCoord,
+        euint32 yCoord
+    ) public {
+        utilityCount += 1;
+        uint256 newId = utilityCount;
+
+        encryptedUtilities[newId] = EncryptedUtility({
+            utilityId: newId,
+            owner: msg.sender,
+            encryptedDepth: depth,
+            encryptedPressure: pressure,
+            encryptedDiameter: diameter,
+            encryptedMaterialCode: materialCode,
+            encryptedXCoord: xCoord,
+            encryptedYCoord: yCoord,
+            timestamp: block.timestamp
+        });
+
+        simulationResults[newId] = SimulationResult({
+            safetyAssessment: "",
+            maintenanceRecommendation: "",
+            conflictWarning: "",
+            isRevealed: false
+        });
+
+        emit UtilityAdded(newId, msg.sender);
+    }
+
+    function requestSafetySimulation(uint256 utilityId) public onlyOwner(utilityId) {
+        require(!simulationResults[utilityId].isRevealed, "Already simulated");
+
+        EncryptedUtility storage utility = encryptedUtilities[utilityId];
+        
+        bytes32[] memory ciphertexts = new bytes32[](6);
+        ciphertexts[0] = FHE.toBytes32(utility.encryptedDepth);
+        ciphertexts[1] = FHE.toBytes32(utility.encryptedPressure);
+        ciphertexts[2] = FHE.toBytes32(utility.encryptedDiameter);
+        ciphertexts[3] = FHE.toBytes32(utility.encryptedMaterialCode);
+        ciphertexts[4] = FHE.toBytes32(utility.encryptedXCoord);
+        ciphertexts[5] = FHE.toBytes32(utility.encryptedYCoord);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.runSimulation.selector);
+        requestToUtilityId[reqId] = utilityId;
+
+        emit SimulationRequested(utilityId);
+    }
+
+    function runSimulation(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 utilityId = requestToUtilityId[requestId];
+        require(utilityId != 0, "Invalid request");
+
+        SimulationResult storage result = simulationResults[utilityId];
+        require(!result.isRevealed, "Already simulated");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        uint32[] memory values = abi.decode(cleartexts, (uint32[]));
+        
+        (result.safetyAssessment, 
+         result.maintenanceRecommendation, 
+         result.conflictWarning) = _calculateSimulationResults(values);
+        
+        result.isRevealed = true;
+
+        emit SimulationCompleted(utilityId);
+    }
+
+    function _calculateSimulationResults(uint32[] memory values) private pure returns (
+        string memory, 
+        string memory, 
+        string memory
+    ) {
+        uint32 depth = values[0];
+        uint32 pressure = values[1];
+        uint32 diameter = values[2];
+        uint32 materialCode = values[3];
+        
+        string memory safety;
+        string memory maintenance;
+        string memory conflict;
+        
+        // Safety assessment logic
+        if (pressure > 80 && depth < 30) {
+            safety = "High Risk - Potential rupture hazard";
+        } else if (pressure > 50 && depth < 50) {
+            safety = "Moderate Risk - Monitor pressure levels";
+        } else {
+            safety = "Low Risk - Within safe parameters";
+        }
+        
+        // Maintenance recommendation
+        if (materialCode == 1 && depth > 50) { // Cast iron pipes
+            maintenance = "Schedule corrosion inspection";
+        } else if (materialCode == 2 && pressure > 60) { // PVC pipes
+            maintenance = "Check for pressure-induced stress";
+        } else {
+            maintenance = "Routine maintenance sufficient";
+        }
+        
+        // Conflict detection (simplified)
+        if (depth < 20 && diameter > 100) {
+            conflict = "Warning: Potential conflict with shallow infrastructure";
+        } else {
+            conflict = "No immediate conflicts detected";
+        }
+        
+        return (safety, maintenance, conflict);
+    }
+
+    function getSimulationResult(uint256 utilityId) public view onlyOwner(utilityId) returns (
+        string memory safety,
+        string memory maintenance,
+        string memory conflict,
+        bool isRevealed
+    ) {
+        SimulationResult storage r = simulationResults[utilityId];
+        return (r.safetyAssessment, r.maintenanceRecommendation, r.conflictWarning, r.isRevealed);
+    }
+
+    function calculateEncryptedRiskScore(uint256 utilityId) public view returns (euint32) {
+        EncryptedUtility storage u = encryptedUtilities[utilityId];
+        euint32 pressureFactor = FHE.mul(u.encryptedPressure, FHE.asEuint32(3));
+        euint32 depthFactor = FHE.div(FHE.asEuint32(100), u.encryptedDepth);
+        return FHE.mul(pressureFactor, depthFactor);
+    }
+
+    function getUtilityTimestamp(uint256 utilityId) public view onlyOwner(utilityId) returns (uint256) {
+        return encryptedUtilities[utilityId].timestamp;
+    }
+}
